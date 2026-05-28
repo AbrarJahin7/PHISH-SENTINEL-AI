@@ -14,7 +14,7 @@ Uses the same files you already have:
 
 import streamlit as st
 from utils import count_suspicious_words, extract_urls, analyze_domains
-from scoring import final_score, verdict
+from scoring import final_score, verdict, explain_weights
 from detector import analyze_email
 
 # Wrapped so the dashboard still loads even if these files have a problem.
@@ -738,13 +738,15 @@ def page_scan():
 
             # Layer 2 — AI  (your detector.py)
             ai = analyze_email(subject, email_text)
-            ai_score = ai.get("score", 0)
+            ai_offline = ai.get("verdict") in (None, "error")
+            # Pass None (not 0) when AI is offline so scoring.py can redistribute weight to ML.
+            ai_score = None if ai_offline else ai.get("score", 0)
 
             # Layer 3 — ML  (your ml_detector.py)
             ml = ml_predict(email_text)
             ml_score = ml["score"] if ml else None
 
-            # Fusion — exact same call signature as your original dashboard
+            # Fusion — dynamic weighting based on which layers are available
             total = final_score(keyword_score, url_score, ai_score, ml_score)
 
         st.markdown("## `> analysis_complete`")
@@ -788,6 +790,23 @@ def page_scan():
         st.markdown("### `> fused_score`")
         st.metric("THREAT SCORE", f"{total}/100")
 
+        # Show which weight profile fired — explains *why* the score came out this way
+        wp = explain_weights(ai_score=ai_score, ml_score=ml_score)
+        profile_color = "var(--green-bright)" if "Full stack" in wp["profile"] else (
+            "var(--amber)" if "Degraded" in wp["profile"] else "var(--green-mid)"
+        )
+        weights_html = " · ".join(
+            f"<span style='color:{profile_color};'>{k.upper()} {v}%</span>"
+            for k, v in wp["weights"].items() if v > 0
+        )
+        st.markdown(f"""
+        <div class="layer-card" style="border-left:3px solid {profile_color};">
+          <div class="layer-title" style="color:{profile_color};">▸ SCORING PROFILE · {wp['profile']}</div>
+          <div class="layer-detail" style="color:#c7ffcd; font-size:0.85rem; margin-bottom:6px;">{wp['note']}</div>
+          <div style="font-family:var(--mono); font-size:0.82rem; letter-spacing:0.1em;">{weights_html}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
         st.markdown("### `> evidence`")
         e1, e2 = st.columns(2)
         with e1:
@@ -813,55 +832,124 @@ def page_inbox():
     brand_banner()
     st.markdown("## `> inbox_monitor`")
     st.markdown(
-        "<p style='color:#5a8a5a;'>Pulls unread emails from your configured mailbox "
-        "and scans each one with all three detection layers.</p>",
+        "<p style='color:#5a8a5a;'>Enter your Gmail credentials below. The system will "
+        "pull your unread emails and scan each one with all three detection layers. "
+        "<b style='color:#ffb000;'>Your credentials are used only for this scan and never stored.</b></p>",
         unsafe_allow_html=True,
     )
 
     if not EMAIL_AVAILABLE:
-        st.warning("[!] email_reader.py is not available or .env is not configured.")
+        st.warning("[!] email_reader.py is not available.")
         return
 
-    if st.button("FETCH & SCAN UNREAD"):
-        with st.spinner("> connecting to imap server..."):
-            try:
-                inbox = fetch_emails(limit=5)
-            except Exception as e:
-                st.error(f"[!] connection failed: {e}")
-                return
+    # ============== CREDENTIAL FORM ==============
+    st.markdown("### `> credentials`")
+    st.markdown(
+        """
+<div class="layer-card" style="border-left:3px solid var(--amber);">
+  <div class="layer-title" style="color:var(--amber);">▸ PRIVACY NOTICE</div>
+  <div class="layer-detail" style="color:#c7ffcd; font-size:0.85rem;">
+    Your credentials are used <b>only</b> for this single scan and are never stored
+    or logged. They live in memory for the duration of the request and disappear
+    when the page reloads. For your safety, use a <b>Gmail App Password</b> — not
+    your real Gmail password.
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
 
-        if not inbox:
-            st.info("[i] no unread emails found.")
+    with st.form("inbox_form", clear_on_submit=False):
+        user_email = st.text_input(
+            "GMAIL ADDRESS",
+            placeholder="yourname@gmail.com",
+            key="inbox_email",
+        )
+        user_password = st.text_input(
+            "GMAIL APP PASSWORD (16 characters)",
+            type="password",
+            placeholder="xxxx xxxx xxxx xxxx",
+            help="Generate one at myaccount.google.com/apppasswords (requires 2-Step Verification enabled).",
+            key="inbox_pass",
+        )
+        limit = st.slider("HOW MANY UNREAD EMAILS TO SCAN", 1, 10, 5, key="inbox_limit")
+        submitted = st.form_submit_button("FETCH & SCAN UNREAD")
+
+    with st.expander("❓ How do I get a Gmail App Password?"):
+        st.markdown("""
+1. Go to **[myaccount.google.com/security](https://myaccount.google.com/security)** and
+   enable **2-Step Verification** (required by Google before App Passwords can be generated).
+2. Visit **[myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)**.
+3. Name the app anything (e.g. "Phish Sentinel"), click **Create**.
+4. Google shows you a **16-character password** like `abcd efgh ijkl mnop`.
+5. Copy it and paste into the field above. Spaces are fine — we strip them automatically.
+6. This password is **scoped to this one app** and can be revoked anytime from the
+   App Passwords page without changing your real Gmail password.
+""")
+
+    if not submitted:
+        return
+
+    if not user_email or not user_password:
+        st.warning("[!] please enter both your Gmail address and App Password.")
+        return
+
+    # ============== FETCH & SCAN ==============
+    with st.spinner("> connecting to imap server..."):
+        try:
+            inbox = fetch_emails(
+                limit=limit,
+                email=user_email,
+                password=user_password,
+            )
+        except Exception as e:
+            err = str(e).lower()
+            if "authentication" in err or "invalid credentials" in err or "login failed" in err:
+                st.error(
+                    "[!] login failed. Double-check that:\n"
+                    "  • the email address is correct\n"
+                    "  • you're using a Gmail **App Password**, not your normal password\n"
+                    "  • 2-Step Verification is enabled on the Google account"
+                )
+            else:
+                st.error(f"[!] connection failed: {e}")
             return
 
-        for i, mail in enumerate(inbox, 1):
-            st.session_state.scans += 1
+    if not inbox:
+        st.info("[i] no unread emails found in that inbox.")
+        return
 
-            kw_score, words = count_suspicious_words(mail["body"])
-            urls = extract_urls(mail["body"])
-            bad_domains = analyze_domains(urls)
-            ai = analyze_email(mail["subject"], mail["body"])
-            ai_score = ai.get("score", 0)
-            ml = ml_predict(mail["body"])
-            ml_score = ml["score"] if ml else None
-            total = final_score(kw_score, len(bad_domains) * 25, ai_score, ml_score)
+    st.success(f"[✓] fetched {len(inbox)} unread email(s). running analysis...")
 
-            with st.expander(f"[{i:02d}] {verdict(total)} — {mail['subject'][:80]}"):
-                render_verdict(total)
-                st.metric("Threat Score", f"{total}/100")
-                st.write("**From:**", mail["sender"])
-                st.write("**Suspicious words:**", words or "none")
-                st.write("**URLs found:**", urls or "none")
-                st.write("**Fake-looking domains:**", bad_domains or "none")
-                if ml:
-                    st.write(
-                        "**ML model:**",
-                        f"{ml['label']} ({ml['score']}% phishing confidence)"
-                    )
-                st.write("**AI verdict:**", ai.get("verdict", "n/a"))
-                st.write("**AI reasons:**")
-                for r in ai.get("reasons", []) or ["(none)"]:
-                    st.write("-", r)
+    for i, mail in enumerate(inbox, 1):
+        st.session_state.scans += 1
+
+        kw_score, words = count_suspicious_words(mail["body"])
+        urls = extract_urls(mail["body"])
+        bad_domains = analyze_domains(urls)
+        ai = analyze_email(mail["subject"], mail["body"])
+        ai_offline = ai.get("verdict") in (None, "error")
+        ai_score = None if ai_offline else ai.get("score", 0)
+        ml = ml_predict(mail["body"])
+        ml_score = ml["score"] if ml else None
+        total = final_score(kw_score, len(bad_domains) * 25, ai_score, ml_score)
+
+        with st.expander(f"[{i:02d}] {verdict(total)} — {mail['subject'][:80]}"):
+            render_verdict(total)
+            st.metric("Threat Score", f"{total}/100")
+            st.write("**From:**", mail["sender"])
+            st.write("**Suspicious words:**", words or "none")
+            st.write("**URLs found:**", urls or "none")
+            st.write("**Fake-looking domains:**", bad_domains or "none")
+            if ml:
+                st.write(
+                    "**ML model:**",
+                    f"{ml['label']} ({ml['score']}% phishing confidence)"
+                )
+            st.write("**AI verdict:**", ai.get("verdict", "n/a"))
+            st.write("**AI reasons:**")
+            for r in ai.get("reasons", []) or ["(none)"]:
+                st.write("-", r)
 
 
 # ============================================================
@@ -983,23 +1071,33 @@ Using a real-world labeled dataset (instead of toy samples) is what lets the tra
 classifier generalize to emails it has never seen before.
 """)
 
-    with st.expander("6. How the scores are fused"):
+    with st.expander("6. How the scores are fused (smart, dynamic weighting)"):
         st.markdown("""
-Each layer outputs a 0–100 score. We blend them with weights:
+Each layer outputs a 0–100 score. We blend them with **weights that adapt to what's
+available**, so no signal is ever wasted when a layer goes offline.
 
-```python
-score = (rules * 0.15) + (urls * 0.15) + (ai * 0.35) + (ml * 0.35)
-```
+**Design philosophy:** the *smart* layers (AI and ML) should dominate the verdict. The
+*supporting* layers (keywords and URLs) should corroborate, never override.
 
-The AI and ML layers carry the most weight because they understand context. Rules are
-supporting evidence — useful as corroboration, dangerous if they overrule everything (you
-could trigger 100 points just by mentioning "password reset" in a legitimate email).
+| Situation | Rules | URLs | AI / LLM | ML Model |
+|---|---|---|---|---|
+| Full stack (all 4 active) | 10% | 10% | **40%** | **40%** |
+| AI offline → ML takes the wheel | 15% | 15% | — | **70%** |
+| ML not trained → AI takes the wheel | 15% | 15% | **70%** | — |
+| Both AI and ML offline (degraded) | 40% | 60% | — | — |
 
-Then we map the final score to a verdict:
+When AI fails, its weight doesn't vanish — **ML inherits it** (jumps from 40% to 70%).
+Same the other way. Rules and URLs only become primary when both intelligent layers
+are unavailable, and even then we warn the user the verdict is heuristic-only.
+
+Final score maps to a verdict:
 
 - `0–39`  → 🟢 SAFE
 - `40–69` → 🟡 SUSPICIOUS
 - `70–100` → 🔴 PHISHING
+
+You'll see the **active weight profile** displayed on every scan result — so you always
+know *why* the score came out the way it did.
 """)
 
     with st.expander("7. Reading real Gmail (IMAP + App Passwords)"):
@@ -1139,7 +1237,7 @@ def page_about():
 <div class="layer-card">
   <div class="layer-title">▸ SUBMITTED TO</div>
   <div class="layer-detail" style="color:#c7ffcd; font-size:0.95rem;">
-    <b style="color:#00b14f;">Mashihoor Sir</b> — Founder, Security Minds Pro.
+    <b style="color:#00b14f;">Mashihoor Sir</b> — Founder of Security Minds Pro.
   </div>
 </div>
 
@@ -1204,4 +1302,4 @@ elif page.endswith("Learn the Project"):
 elif page.endswith("Tech Stack"):
     page_tech()
 else:
-    page_about() 
+    page_about()
